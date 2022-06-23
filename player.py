@@ -50,6 +50,7 @@ if __name__=="__main__":
     ml_control = False
 
     running = True
+    agent_score = 0
 
     while running:
         # Fill the background with white
@@ -72,24 +73,6 @@ if __name__=="__main__":
         ]])
 
         out_vec = model(in_vec)
-
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-            if event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_LEFT:
-                    moving_left = True
-                if event.key == pygame.K_RIGHT:
-                    moving_right = True
-                if event.key == pygame.K_SPACE:
-                    ml_control = True
-            if event.type == pygame.KEYUP:
-                if event.key == pygame.K_LEFT:
-                    moving_left = False
-                if event.key == pygame.K_RIGHT:
-                    moving_right = False
-                if event.key == pygame.K_SPACE:
-                    ml_control = False
 
         ai_moving_left = False
         ai_moving_right = False
@@ -145,8 +128,12 @@ if __name__=="__main__":
         if ball_loc[1] > HEIGHT-paddle_height-5:
             if ball_loc[0] > paddle_loc[0] - paddle_width/2 and ball_loc[0] < paddle_loc[0] + paddle_width/2:
                 ball_speed[1] = -ball_speed[1]
+                agent_score += 1
             else:
+                # Reset, episode over
                 ball_loc[1] = 0
+                # training
+                agent_score = 0
         if ball_loc[1] < 0:
             ball_speed[1] = -ball_speed[1]
         if ball_loc[0] > WIDTH:
