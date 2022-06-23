@@ -15,9 +15,9 @@ class GameModel(torch.nn.Module):
         self.third = torch.nn.Linear(10, 3)
 
     def forward(self, x):
-        x = torch.nn.functional.relu(self.first(x))
-        x = torch.nn.functional.relu(self.second(x))
-        x = torch.nn.functional.relu(self.third(x))
+        x = torch.nn.functional.silu(self.first(x))
+        x = torch.nn.functional.silu(self.second(x))
+        x = self.third(x)
 
         return torch.nn.functional.softmax(x, -1)
 
