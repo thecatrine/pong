@@ -13,9 +13,9 @@ import random
 class GameModel(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.first = torch.nn.Linear(6, 10)
-        self.second = torch.nn.Linear(10, 10)
-        self.third = torch.nn.Linear(10, 1)
+        self.first = torch.nn.Linear(8, 32)
+        self.second = torch.nn.Linear(32, 32)
+        self.third = torch.nn.Linear(32, 1)
 
     def forward(self, x):
         x = torch.nn.functional.silu(self.first(x))
@@ -29,7 +29,7 @@ class GameModel(torch.nn.Module):
 model = GameModel()
 #loss_fn = torch.nn.CrossEntropyLoss()
 loss_fn = torch.nn.MSELoss()
-optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
 MEMORY_LEN = 1000
 
@@ -44,6 +44,7 @@ displaying = True
 running_average_loss = 0.0
 
 reward = 0.0
+action_we_picked_last = torch.zeros(8).numpy()
 
 if __name__=="__main__":
     # game stuff
@@ -103,12 +104,18 @@ if __name__=="__main__":
 
 
         action_values = []
+        action_states = []
         for action in range(3):
-            state_and_action = torch.tensor([state + [action]])
+            # convert action to one-hot
+            action_one_hot = torch.zeros(3)
+            action_one_hot[action] = 1
+
+            state_and_action = torch.cat([torch.tensor(state), action_one_hot])
 
             # Predict value
             #print("1", state_and_action)
             action_values.append(model(state_and_action)[0])
+            action_states.append(state_and_action)
 
         # Add randomness?
 
@@ -156,7 +163,7 @@ if __name__=="__main__":
         ball_loc[1] += ball_speed[1]
 
         scored = False
-        torch.autograd.set_detect_anomaly(True)
+        #torch.autograd.set_detect_anomaly(True)
 
         new_reward = 0.0
 
@@ -182,7 +189,8 @@ if __name__=="__main__":
         score = action_values[action_to_pick]
 
         # save state and reward
-        state_memory.append(state + [action_to_pick])
+        #print(action_states)
+        state_memory.append(action_we_picked_last)
         score_memory.append(score)
         
         pred_reward = action_values[action_to_pick].item()
@@ -214,6 +222,7 @@ if __name__=="__main__":
 
     
         reward = new_reward
+        action_we_picked_last = action_states[action_to_pick].detach().numpy()
         
 
     # Done! Time to quit.
