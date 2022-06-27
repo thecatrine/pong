@@ -1,14 +1,22 @@
 from re import A
 import pygame
 import torch
+import numpy
 
 import collections as c
 import random
+import argparse
 
 #model stuff
 
 # input - [paddle x, ball x, ball y, ball vx, ball vy]
 # output - [left, still, right]
+
+# parse args
+parser = argparse.ArgumentParser()
+parser.add_argument('--model', type=str, default='', help='model file to load')
+parser.add_argument('--device', type=str, default='cuda', help='device to use')
+args = parser.parse_args()
 
 class GameModel(torch.nn.Module):
     def __init__(self):
@@ -29,9 +37,17 @@ class GameModel(torch.nn.Module):
 #LR = 1e-3
 # init model
 model = GameModel()
+if args.model:
+    model.load_state_dict(torch.load(args.model))
+    print('Loaded model from', args.model)
+
 #loss_fn = torch.nn.CrossEntropyLoss()
 loss_fn = torch.nn.L1Loss()
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+# initialize device
+device = torch.device(args.device)
+model.to(device)
 
 MEMORY_LEN = 1000
 
@@ -88,6 +104,8 @@ if __name__=="__main__":
             pygame.draw.rect(screen, (0, 0, 0), (paddle_loc[0]-paddle_width/2, paddle_loc[1], paddle_width, paddle_height))
             # Flip the display
             pygame.display.flip()
+            # sleep for a bit
+            pygame.time.delay(10)
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -112,7 +130,7 @@ if __name__=="__main__":
             action_one_hot = torch.zeros(3)
             action_one_hot[action] = 1
 
-            state_and_action = torch.cat([torch.tensor(state), action_one_hot])
+            state_and_action = torch.cat([torch.tensor(state), action_one_hot]).to(device)
 
             # Predict value
             #print("1", state_and_action)
@@ -132,7 +150,10 @@ if __name__=="__main__":
             else:
                 #print(action_values)
                 # RSI select probabilistically
-                action_to_pick = torch.argmax(torch.tensor(action_values))
+                #action_probs = torch.nn.functional.softmax(torch.tensor(action_values), dim=0)
+                #action_to_pick = torch.multinomial(action_probs, 1)[0].item()
+                action_to_pick = torch.argmax(torch.tensor(action_values)).item()
+                #print(action_probs, action_to_pick)
 
             #print("Picked ", action_to_pick)
             #print
@@ -168,6 +189,10 @@ if __name__=="__main__":
         #torch.autograd.set_detect_anomaly(True)
 
         new_reward = 0.0
+        #if ai_moving_left:
+        #    new_reward -= 1.0
+        #if ai_moving_right:
+        #    new_reward -= 1.0
 
         if ball_loc[1] > HEIGHT-paddle_height-5:
             if ball_loc[0] > paddle_loc[0] - paddle_width/2 and ball_loc[0] < paddle_loc[0] + paddle_width/2:
@@ -209,9 +234,9 @@ if __name__=="__main__":
         if reward != 0.0:
             optimizer.zero_grad()
 
-            predicted_score = model(torch.tensor(state_memory))
+            predicted_score = model(torch.tensor(numpy.array(state_memory)).to(device))
 
-            loss = loss_fn(predicted_score, torch.tensor(reward_for_training).unsqueeze(-1))
+            loss = loss_fn(predicted_score, torch.tensor(reward_for_training).unsqueeze(-1).to(device))
 
             loss.backward(retain_graph=True)        
             optimizer.step()
@@ -224,8 +249,11 @@ if __name__=="__main__":
 
     
         reward = new_reward
-        action_we_picked_last = action_states[action_to_pick].detach().numpy()
+        action_we_picked_last = action_states[action_to_pick].cpu().detach().numpy()
         
 
     # Done! Time to quit.
     pygame.quit()
+
+# Save model to file
+torch.save(model.state_dict(), 'model.pt')
