@@ -13,13 +13,15 @@ import random
 class GameModel(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.first = torch.nn.Linear(8, 32)
-        self.second = torch.nn.Linear(32, 32)
-        self.third = torch.nn.Linear(32, 1)
+        self.first = torch.nn.Linear(8, 256)
+        self.second = torch.nn.Linear(256, 256)
+        self.second_two = torch.nn.Linear(256, 256)
+        self.third = torch.nn.Linear(256, 1)
 
     def forward(self, x):
         x = torch.nn.functional.silu(self.first(x))
         x = torch.nn.functional.silu(self.second(x))
+        x = torch.nn.functional.silu(self.second_two(x))
         x = self.third(x)
 
         return x
@@ -28,8 +30,8 @@ class GameModel(torch.nn.Module):
 # init model
 model = GameModel()
 #loss_fn = torch.nn.CrossEntropyLoss()
-loss_fn = torch.nn.MSELoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+loss_fn = torch.nn.L1Loss()
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
 
 MEMORY_LEN = 1000
 
@@ -204,7 +206,7 @@ if __name__=="__main__":
             pred_reward = reward_for_training[i] * decay
 
 
-        if True: #reward != 0.0:
+        if reward != 0.0:
             optimizer.zero_grad()
 
             predicted_score = model(torch.tensor(state_memory))
