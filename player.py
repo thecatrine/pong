@@ -73,6 +73,8 @@ running_average_loss = 0.0
 
 reward = 0.0
 
+hits = 0.0
+
 if __name__=="__main__":
     # game stuff
 
@@ -133,6 +135,8 @@ if __name__=="__main__":
             old_pixels = pixels
 
         pixels_diff = pixels - old_pixels
+
+        old_pixels = pixels
         
 
         for event in pygame.event.get():
@@ -204,6 +208,7 @@ if __name__=="__main__":
             if ball_loc[0] > paddle_loc[0] - paddle_width/2 and ball_loc[0] < paddle_loc[0] + paddle_width/2:
                 ball_speed[1] = -ball_speed[1]
                 new_reward = 100.0
+                hits += 1
             else:
                 # Reset, episode over
                 ball_loc[1] = 0
@@ -259,7 +264,8 @@ if __name__=="__main__":
         if counter % 1000 == 999:
             avg_loss = torch.mean(loss).item()
             running_average_loss = (running_average_loss * 0.90) + (avg_loss * 0.1)
-            print("avg loss: ", avg_loss, running_average_loss)
+            print("avg loss: ", avg_loss, running_average_loss, "hits: ", hits)
+            hits = 0
 
 
     
