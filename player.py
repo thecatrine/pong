@@ -21,16 +21,25 @@ args = parser.parse_args()
 class GameModel(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.first = torch.nn.Linear(8, 256)
-        self.second = torch.nn.Linear(256, 256)
-        self.second_two = torch.nn.Linear(256, 256)
-        self.third = torch.nn.Linear(256, 1)
+        # taken from https://pytorch.org/tutorials/intermediate/mario_rl_tutorial.html
+        # no idea if they're good here, should think this through
+        self.first = torch.nn.Conv2d(1, 32, kernel_size=8, stride=4)
+        self.second = torch.nn.Conv2d(32, 64, kernel_size=4, stride=2)
+        self.third = torch.nn.Conv2d(64, 64, kernel_size=3, stride=1)
+
+        self.linear = torch.nn.Linear(9216, 256)
+        self.linear_two = torch.nn.Linear(256, 3)
+        # here we're predicting scores for each of the 3 actions
+        # rather than predicting score given an action
 
     def forward(self, x):
         x = torch.nn.functional.silu(self.first(x))
         x = torch.nn.functional.silu(self.second(x))
-        x = torch.nn.functional.silu(self.second_two(x))
-        x = self.third(x)
+        x = torch.nn.functional.silu(self.third(x))
+        x = x.view(x.size(0), -1)
+
+        x = torch.nn.functional.silu(self.linear(x))
+        x = self.linear_two(x)
 
         return x
 
@@ -42,16 +51,17 @@ if args.model:
     print('Loaded model from', args.model)
 
 #loss_fn = torch.nn.CrossEntropyLoss()
-loss_fn = torch.nn.L1Loss()
+loss_fn = torch.nn.SmoothL1Loss()
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
 
 # initialize device
 device = torch.device(args.device)
 model.to(device)
 
-MEMORY_LEN = 1000
+MEMORY_LEN = 100
 
 state_memory = c.deque([], maxlen=MEMORY_LEN)
+
 score_memory = c.deque([], maxlen=MEMORY_LEN)
 reward_memory = c.deque([], maxlen=MEMORY_LEN)
 
@@ -62,7 +72,6 @@ displaying = True
 running_average_loss = 0.0
 
 reward = 0.0
-action_we_picked_last = torch.zeros(8).numpy()
 
 if __name__=="__main__":
     # game stuff
@@ -89,23 +98,42 @@ if __name__=="__main__":
     running = True
     agent_score = 0
 
-    rendering = False
+    rendering = True
 
     counter = 0
+
+    old_pixels = None
+
+    last_state_and_action = None
+
+    random_action = 0
+    random_movement_counter = 0
+
     while running:
         counter += 1
         #print(foo_counter)
-        if rendering:
-            # Fill the background with white
-            screen.fill((255, 255, 255))
+        # Fill the background with white
+        screen.fill((255, 255, 255))
 
-            # Draw a solid blue circle in the center
-            pygame.draw.circle(screen, (0, 0, 0), ball_loc, 5)
-            pygame.draw.rect(screen, (0, 0, 0), (paddle_loc[0]-paddle_width/2, paddle_loc[1], paddle_width, paddle_height))
+        # Draw a solid blue circle in the center
+        pygame.draw.circle(screen, (0, 0, 0), ball_loc, 5)
+        pygame.draw.rect(screen, (0, 0, 0), (paddle_loc[0]-paddle_width/2, paddle_loc[1], paddle_width, paddle_height))
+        
+        if rendering:
             # Flip the display
             pygame.display.flip()
             # sleep for a bit
             pygame.time.delay(10)
+
+        # can we just reference them?
+        small = pygame.transform.scale(screen, (128, 128))
+
+        pixels = torch.tensor(1 - (pygame.surfarray.array_red(small) / 255.0)).float().unsqueeze(0)
+        if old_pixels is None:
+            old_pixels = pixels
+
+        pixels_diff = pixels - old_pixels
+        
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -114,47 +142,32 @@ if __name__=="__main__":
                 if event.key == pygame.K_SPACE:
                     rendering = not rendering
 
-        state = [
-            ((paddle_loc[0]/WIDTH)-0.5),
-            ((ball_loc[0]/WIDTH)-0.5),
-            ((ball_loc[1]/HEIGHT)-0.5),
-            ((ball_speed[0]/5)-0.5),
-            ((ball_speed[1]/5)-0.5),
-        ]
 
-
-        action_values = []
-        action_states = []
-        for action in range(3):
-            # convert action to one-hot
-            action_one_hot = torch.zeros(3)
-            action_one_hot[action] = 1
-
-            state_and_action = torch.cat([torch.tensor(state), action_one_hot]).to(device)
-
-            # Predict value
-            #print("1", state_and_action)
-            action_values.append(model(state_and_action)[0])
-            action_states.append(state_and_action)
-
-        # Add randomness?
+        # predict value of each action
+        action_values = model(pixels_diff.unsqueeze(0).to(device))[0]
 
         ai_moving_left = False
         ai_moving_right = False
 
         if ml_control:
+            #print(random_movement_counter, random_action)
             # overwrite player action
-            if random.random() < 0.03:
-                action_to_pick = random.randint(0, 2)
+            if random_movement_counter == 0 and random.random() < 0.01:
+                random_movement_counter = 20
+                random_action = random.randint(0, 2)
                 #print("choosing randomly")
             else:
                 #print(action_values)
                 # RSI select probabilistically
                 #action_probs = torch.nn.functional.softmax(torch.tensor(action_values), dim=0)
                 #action_to_pick = torch.multinomial(action_probs, 1)[0].item()
-                action_to_pick = torch.argmax(torch.tensor(action_values)).item()
-                #print(action_probs, action_to_pick)
+                action_to_pick = torch.argmax(action_values).item()
+                #print("picking", action_values, action_to_pick)
 
+            if random_movement_counter > 0:
+                random_movement_counter -= 1
+                action_to_pick = random_action
+                
             #print("Picked ", action_to_pick)
             #print
 
@@ -170,7 +183,7 @@ if __name__=="__main__":
             print("unsupported")
             pass
 
-        real_new_score = 0
+        new_reward = 0.0
 
         # update physics for next frame
         if moving_left or ai_moving_left:
@@ -185,14 +198,7 @@ if __name__=="__main__":
         ball_loc[0] += ball_speed[0]
         ball_loc[1] += ball_speed[1]
 
-        scored = False
         #torch.autograd.set_detect_anomaly(True)
-
-        new_reward = 0.0
-        #if ai_moving_left:
-        #    new_reward -= 1.0
-        #if ai_moving_right:
-        #    new_reward -= 1.0
 
         if ball_loc[1] > HEIGHT-paddle_height-5:
             if ball_loc[0] > paddle_loc[0] - paddle_width/2 and ball_loc[0] < paddle_loc[0] + paddle_width/2:
@@ -213,16 +219,13 @@ if __name__=="__main__":
             ball_speed[0] = -ball_speed[0]
  
 
-        score = action_values[action_to_pick]
-
         # save state and reward
         #print(action_states)
-        state_memory.append(action_we_picked_last)
-        score_memory.append(score)
+        if last_state_and_action is not None:
+            state_memory.append(last_state_and_action)
+            reward_memory.append(reward)
         
-        pred_reward = action_values[action_to_pick].item()
-
-        reward_memory.append(reward)
+        pred_reward = action_values[action_to_pick]
 
         reward_for_training = reward_memory.copy()
         for i in range(len(reward_for_training)-1, 0-1, -1):
@@ -234,11 +237,23 @@ if __name__=="__main__":
         if reward != 0.0:
             optimizer.zero_grad()
 
-            predicted_score = model(torch.tensor(numpy.array(state_memory)).to(device))
+            states_for_training = []
+            actions_for_training = []
+            for i in state_memory:
+                states_for_training.append(i[0])
+                actions_for_training.append(i[1])
 
-            loss = loss_fn(predicted_score, torch.tensor(reward_for_training).unsqueeze(-1).to(device))
+            predicted_scores = model(torch.stack(states_for_training).to(device))
+            predicted_and_chosen_scores = predicted_scores.gather(1, torch.tensor(actions_for_training).unsqueeze(-1).to(device))
 
-            loss.backward(retain_graph=True)        
+            actual_scores = torch.tensor(reward_for_training).to(device)
+
+            #import pdb; pdb.set_trace()
+            loss = loss_fn(predicted_and_chosen_scores, actual_scores)
+
+            #import pdb; pdb.set_trace()
+
+            loss.backward()        
             optimizer.step()
 
         if counter % 1000 == 999:
@@ -249,7 +264,7 @@ if __name__=="__main__":
 
     
         reward = new_reward
-        action_we_picked_last = action_states[action_to_pick].cpu().detach().numpy()
+        last_state_and_action = (pixels_diff, action_to_pick)
         
 
     # Done! Time to quit.
