@@ -60,7 +60,10 @@ model.to(device)
 
 MEMORY_LEN = 100
 
-state_memory = c.deque([], maxlen=MEMORY_LEN)
+#state_memory = c.deque([], maxlen=MEMORY_LEN)
+
+state_memory = torch.tensor([]).to(device)
+action_memory = torch.tensor([], dtype=torch.int64).to(device)
 
 score_memory = c.deque([], maxlen=MEMORY_LEN)
 reward_memory = c.deque([], maxlen=MEMORY_LEN)
@@ -227,7 +230,13 @@ if __name__=="__main__":
         # save state and reward
         #print(action_states)
         if last_state_and_action is not None:
-            state_memory.append(last_state_and_action)
+            state_memory = torch.cat((state_memory, last_state_and_action[0].unsqueeze(0).to(device)), dim=0)
+            action_memory = torch.cat((action_memory, torch.tensor([last_state_and_action[1]]).to(device)), dim=0)
+
+            if state_memory.shape[0] > MEMORY_LEN:
+                state_memory = state_memory[1:]
+                action_memory = action_memory[1:]
+
             reward_memory.append(reward)
         
         pred_reward = action_values[action_to_pick]
@@ -242,14 +251,8 @@ if __name__=="__main__":
         if reward != 0.0:
             optimizer.zero_grad()
 
-            states_for_training = []
-            actions_for_training = []
-            for i in state_memory:
-                states_for_training.append(i[0])
-                actions_for_training.append(i[1])
-
-            predicted_scores = model(torch.stack(states_for_training).to(device))
-            predicted_and_chosen_scores = predicted_scores.gather(1, torch.tensor(actions_for_training).unsqueeze(-1).to(device))
+            predicted_scores = model(state_memory)
+            predicted_and_chosen_scores = predicted_scores.gather(1, torch.tensor(action_memory).unsqueeze(-1).to(device))
 
             actual_scores = torch.tensor(reward_for_training).to(device)
 
