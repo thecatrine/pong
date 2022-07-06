@@ -1,7 +1,7 @@
 from re import A
 import pygame
 import torch
-import numpy
+import numpy as np
 
 import collections as c
 import random
@@ -35,7 +35,7 @@ class PongEnv():
 
         self.screen = pygame.display.set_mode([self.WIDTH, self.HEIGHT])
 
-        self.GAME_LIMIT = 1000
+        self.GAME_LIMIT = 1_000
 
     def reset(self):
         self.ball_loc = [250, 0]
@@ -44,7 +44,9 @@ class PongEnv():
         self.game_counter = 0
         self.old_pixels = None
 
-    def step(self, action, render=False):
+        return self.step()
+
+    def step(self, action=0, render=False):
         reward = 0
         done = False
         self.game_counter += 1
@@ -103,7 +105,7 @@ class PongEnv():
         # can we just reference them?
         small = pygame.transform.scale(self.screen, (128, 128))
 
-        pixels = torch.tensor(1 - (pygame.surfarray.array_red(small) / 255.0)).float().unsqueeze(0)
+        pixels = torch.tensor(1 - (pygame.surfarray.array_red(small) / 255.0)).float().unsqueeze(0).detach()
         if self.old_pixels is None:
             self.old_pixels = pixels
 
@@ -139,7 +141,88 @@ class GameModel(torch.nn.Module):
         x = torch.nn.functional.silu(self.linear(x))
         x = self.linear_two(x)
 
-        return x
+        return torch.nn.functional.softmax(x, dim=1)
+
+
+def compute_loss(net, obvs, actions, rewards):
+    res = net(obvs)
+    logprobs = res.gather(1, actions.unsqueeze(-1))
+    return -torch.mean(logprobs * rewards)
+
+rendering = True
+running = True
+
+def train_one_epoch(net, optimizer, env):
+    global rendering
+    global running
+
+    batch_obvs = []
+    batch_actions = []
+    batch_weights = []
+    batch_returns = []
+    batch_lens = []
+
+    pixels_diff, reward, done = env.reset()
+    ep_rewards = []
+    done = False
+
+    BATCH_SIZE = 5_000
+
+    while True:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+                break
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_SPACE:
+                    rendering = not rendering
+        
+        batch_obvs.append(pixels_diff.unsqueeze(0))
+
+        #print(len(batch_obvs))
+
+        #import pdb; pdb.set_trace()
+
+        act_probs = net(pixels_diff.unsqueeze(0).to(device))
+        act = torch.multinomial(act_probs, 1).item()
+
+        pixels_diff, reward, done = env.step(act, rendering)
+
+        batch_actions.append(act)
+        ep_rewards.append(reward)
+
+        if done:
+            ep_return, ep_len = sum(ep_rewards), len(ep_rewards)
+            batch_returns.append(ep_return)
+            batch_lens.append(ep_len)
+
+            batch_weights += [ep_return] * ep_len
+
+            #import pdb; pdb.set_trace()
+
+            # Reset the environment for another episode
+            pixels_diff, reward, done = env.reset()
+            done = False
+            ep_rewards = []
+
+            if len(batch_obvs) > BATCH_SIZE:
+                break
+
+    optimizer.zero_grad()
+
+    #import pdb; pdb.set_trace()
+    batch_loss = compute_loss(
+        net, 
+        torch.cat(batch_obvs, dim=0).to(device), 
+        torch.tensor(batch_actions).to(device), 
+        torch.tensor(batch_weights).to(device),
+    )
+
+    batch_loss.backward()
+    optimizer.step()
+
+    return batch_loss, batch_returns, batch_lens
+
 
 #LR = 1e-3
 # init model
@@ -149,130 +232,23 @@ if args.model:
     print('Loaded model from', args.model)
 
 #loss_fn = torch.nn.CrossEntropyLoss()
-loss_fn = torch.nn.SmoothL1Loss()
+#loss_fn = torch.nn.SmoothL1Loss()
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
 
 # initialize device
 device = torch.device(args.device)
 model.to(device)
 
-MEMORY_LEN = 100
-
-#state_memory = c.deque([], maxlen=MEMORY_LEN)
-
-state_memory = torch.tensor([]).to(device)
-action_memory = torch.tensor([], dtype=torch.int64).to(device)
-
-score_memory = c.deque([], maxlen=MEMORY_LEN)
-reward_memory = c.deque([], maxlen=MEMORY_LEN)
-
-decay = 0.99
-
-displaying = True
-
-running_average_loss = 0.0
-
-reward = 0.0
-
-hits = 0.0
-rendering = False
 
 if __name__=="__main__":
     env = PongEnv()
-    env.reset()
-    # game stuff
-    running = True
-    agent_score = 0
 
-    counter = 0
-
-    old_pixels = None
-
-    last_state_and_action = None
-
-    random_action = 0
-    random_movement_counter = 0
-
-    pixels_diff, reward, done = env.step(random_action)
-
+    i = 0
     while running:
-        counter += 1
-        #print(foo_counter)
-        # Fill the background with white
-        
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-            if event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_SPACE:
-                    rendering = not rendering
-
-
-
-        # predict value of each action
-        action_values = model(pixels_diff.unsqueeze(0).to(device))[0]
-
-        if random_movement_counter == 0 and random.random() < 0.01:
-            random_movement_counter = 20
-            random_action = random.randint(0, 2)
-
-        else:
-            action_to_pick = torch.argmax(action_values).item()
-
-        if random_movement_counter > 0:
-            random_movement_counter -= 1
-            action_to_pick = random_action
-
-
-        pixels_diff, new_reward, done = env.step(action_to_pick, render=rendering)
-        
-        # save state and reward
-        #print(action_states)
-        if last_state_and_action is not None:
-            state_memory = torch.cat((state_memory, last_state_and_action[0].unsqueeze(0).to(device)), dim=0)
-            action_memory = torch.cat((action_memory, torch.tensor([last_state_and_action[1]]).to(device)), dim=0)
-
-            if state_memory.shape[0] > MEMORY_LEN:
-                state_memory = state_memory[1:]
-                action_memory = action_memory[1:]
-
-            reward_memory.append(reward)
-        
-        pred_reward = action_values[action_to_pick]
-
-        reward_for_training = reward_memory.copy()
-        for i in range(len(reward_for_training)-1, 0-1, -1):
-            #print(i)
-            reward_for_training[i] += pred_reward
-            pred_reward = reward_for_training[i] * decay
-
-
-        if reward != 0.0:
-            optimizer.zero_grad()
-
-            predicted_scores = model(state_memory)
-            predicted_and_chosen_scores = predicted_scores.gather(1, torch.tensor(action_memory).unsqueeze(-1).to(device))
-
-            actual_scores = torch.tensor(reward_for_training).to(device)
-
-            #import pdb; pdb.set_trace()
-            loss = loss_fn(predicted_and_chosen_scores, actual_scores)
-
-            #import pdb; pdb.set_trace()
-
-            loss.backward()        
-            optimizer.step()
-
-        if counter % 1000 == 999:
-            avg_loss = torch.mean(loss).item()
-            running_average_loss = (running_average_loss * 0.90) + (avg_loss * 0.1)
-            print("avg loss: ", avg_loss, running_average_loss, "hits: ", hits)
-            hits = 0
-
-
-    
-        reward = new_reward
-        last_state_and_action = (pixels_diff, action_to_pick)
+        i += 1
+        batch_loss, batch_returns, batch_lens = train_one_epoch(model, optimizer, env)
+        print('epoch: %3d \t loss: %.3f \t return: %.3f \t ep_len: %.3f'%
+                (i, batch_loss, np.mean(batch_returns), np.mean(batch_lens)))
         
 
     # Done! Time to quit.
