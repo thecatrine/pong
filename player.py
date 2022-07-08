@@ -150,31 +150,6 @@ class RewardNetwork(torch.nn.Module):
 
         return x
 
-class PolicyNetwork(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        # taken from https://pytorch.org/tutorials/intermediate/mario_rl_tutorial.html
-        # no idea if they're good here, should think this through
-        self.first = torch.nn.Conv2d(2, 32, kernel_size=8, stride=4)
-        self.second = torch.nn.Conv2d(32, 64, kernel_size=4, stride=2)
-        self.third = torch.nn.Conv2d(64, 64, kernel_size=3, stride=1)
-
-        self.linear = torch.nn.Linear(1024, 256)
-        self.linear_two = torch.nn.Linear(256, 3)
-        # here we're predicting scores for each of the 3 actions
-        # rather than predicting score given an action
-
-    def forward(self, x):
-        x = torch.nn.functional.silu(self.first(x))
-        x = torch.nn.functional.silu(self.second(x))
-        x = torch.nn.functional.silu(self.third(x))
-        x = x.view(x.size(0), -1)
-
-        x = torch.nn.functional.silu(self.linear(x))
-        x = self.linear_two(x)
-
-        return torch.nn.functional.softmax(x, dim=1)
-
 
 def compute_loss(net, obvs, actions, rewards):
     res = net(obvs)
@@ -186,7 +161,7 @@ running = True
 
 memory = collections.deque(maxlen=2000)
 
-def train_one_epoch(p_net, p_optimizer, r_net, r_optimizer, env):
+def train_one_epoch(r_net, r_optimizer, env):
     global rendering
     global running
 
@@ -201,7 +176,7 @@ def train_one_epoch(p_net, p_optimizer, r_net, r_optimizer, env):
     done = False
 
     BATCH_SIZE = 1000
-    BUFFER_SIZE = 200
+    BUFFER_SIZE = 300
 
     ALPHA = 0.95
 
@@ -223,11 +198,6 @@ def train_one_epoch(p_net, p_optimizer, r_net, r_optimizer, env):
         
         batch_obvs.append(first_obvs)
 
-        # get the action
-
-        #act_probs = p_net(first_obvs.to(device))
-        #act = torch.multinomial(act_probs, 1).item()
-
         # Get rewards estimate from critic
         pred_rewards = r_net(first_obvs.to(device))[0]
         act = torch.argmax(pred_rewards)
@@ -242,21 +212,6 @@ def train_one_epoch(p_net, p_optimizer, r_net, r_optimizer, env):
 
         if rendering:
             print(pred_rewards)
-
-        if done or len(batch_obvs) >= BATCH_SIZE:
-            ep_return, ep_len = sum(ep_rewards), len(ep_rewards)
-            batch_returns.append(ep_return)
-            batch_lens.append(ep_len)
-
-            #import pdb; pdb.set_trace()
-
-            # Reset the environment for another episode
-            #pixels_diff, reward, done = env.reset()
-            done = False
-            ep_rewards = []
-
-            if len(batch_obvs) >= BATCH_SIZE:
-                break
 
         if len(memory) >= BUFFER_SIZE:
             batch = random.sample(memory, BUFFER_SIZE)
@@ -281,7 +236,7 @@ def train_one_epoch(p_net, p_optimizer, r_net, r_optimizer, env):
 
             actual_scores = torch.tensor(rewards).to(device) + ALPHA * old_preds[0]
 
-            loss_fn = torch.nn.MSELoss()
+            loss_fn = torch.nn.SmoothL1Loss()
             score_loss = loss_fn(predicted_and_chosen_scores, actual_scores)
 
             #import pdb; pdb.set_trace()
@@ -292,20 +247,6 @@ def train_one_epoch(p_net, p_optimizer, r_net, r_optimizer, env):
     # save changes to value net
     r_net.load_state_dict(saved_r_model.state_dict())
 
-    # Do optimizer step for policy network
-    p_optimizer.zero_grad()
-
-    #import pdb; pdb.set_trace()
-    batch_loss = compute_loss(
-        p_net, 
-        torch.cat(batch_obvs, dim=0).to(device), 
-        torch.tensor(batch_policy_actions).to(device), 
-        torch.tensor(batch_weights).to(device),
-    )
-
-    batch_loss.backward()
-    p_optimizer.step()
-
     if rendering:
         pass
         #import pdb; pdb.set_trace()
@@ -315,31 +256,26 @@ def train_one_epoch(p_net, p_optimizer, r_net, r_optimizer, env):
 
 #LR = 1e-3
 # init model
-policy_model = PolicyNetwork()
 
 reward_model = RewardNetwork()
 
 #loss_fn = torch.nn.CrossEntropyLoss()
 #loss_fn = torch.nn.SmoothL1Loss()
-policy_optimizer = torch.optim.AdamW(policy_model.parameters(), lr=1e-3)
 reward_optimizer = torch.optim.AdamW(reward_model.parameters(), lr=1e-3)
 
 # initialize device
 device = torch.device(args.device)
 reward_model.to(device)
-policy_model.to(device)
 
 
 if __name__=="__main__":
-    envs = PongEnv()
+    env = PongEnv()
     env.reset()
 
     i = 0
     while running:
         i += 1
         batch_loss, score_loss, batch_returns, batch_lens = train_one_epoch(
-            policy_model, 
-            policy_optimizer, 
             reward_model, 
             reward_optimizer, 
             env,
