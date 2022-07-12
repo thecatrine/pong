@@ -89,11 +89,11 @@ class PongEnv():
             if (self.ball_loc[0] > self.paddle_loc[0] - self.paddle_width/2) and \
                (self.ball_loc[0] < self.paddle_loc[0] + self.paddle_width/2):
                 self.ball_speed[1] = -self.ball_speed[1]
-                reward = 100.0
+                reward = 1.0
             else:
                 # Reset the ball
                 self.ball_loc[1] = 0
-                reward = -100.0
+                reward = -1.0
 
 
         # Render image to get next state
@@ -136,8 +136,9 @@ class RewardNetwork(torch.nn.Module):
         self.third = torch.nn.Conv2d(64, 64, kernel_size=3, stride=1)
 
         self.linear = torch.nn.Linear(1024, 256)
-        self.linear_two = torch.nn.Linear(256, 3)
-        # here we're predicting scores for each of the 3 a
+        self.reward_head = torch.nn.Linear(256, 3)
+
+        self.policy_head = torch.nn.Linear(256, 3)
 
     def forward(self, x):
         x = torch.nn.functional.silu(self.first(x))
@@ -146,14 +147,25 @@ class RewardNetwork(torch.nn.Module):
         x = x.view(x.size(0), -1)
 
         x = torch.nn.functional.silu(self.linear(x))
-        x = self.linear_two(x)
-
+       
         return x
+
+    def reward(self, x ):
+        return self.reward_head(x)
+
+    def policy(self, x ):
+        return torch.softmax(self.policy_head(x), dim=-1)
+
+    
 
 
 def compute_loss(net, obvs, actions, rewards):
-    res = net(obvs)
+    res = net.policy(net(obvs))
     logprobs = res.gather(1, actions.unsqueeze(-1))
+
+    if logprobs.shape != rewards.shape:
+        import pdb; pdb.set_trace()
+
     return -torch.mean(logprobs * rewards)
 
 rendering = True
@@ -174,18 +186,23 @@ def train_one_epoch(r_net, r_optimizer, env):
     pixels_diff, reward, done = env.step()
     ep_rewards = []
     done = False
+    stop = False
 
     BATCH_SIZE = 1000
-    BUFFER_SIZE = 300
+    BUFFER_SIZE = 100
 
     ALPHA = 0.95
 
     score_loss = 0
+    actor_loss = 0
 
     saved_r_model = RewardNetwork().to(device)
     saved_r_model.load_state_dict(r_net.state_dict())
 
-    while True:
+    training_batches = 0
+    memory_counter = 0
+
+    while not stop:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
@@ -194,13 +211,18 @@ def train_one_epoch(r_net, r_optimizer, env):
                 if event.key == pygame.K_SPACE:
                     rendering = not rendering
 
-        first_obvs = pixels_diff.unsqueeze(0)
+        first_obvs = pixels_diff.unsqueeze(0).to(device)
         
         batch_obvs.append(first_obvs)
 
+        x = r_net(first_obvs.to(device))
+
         # Get rewards estimate from critic
-        pred_rewards = r_net(first_obvs.to(device))[0]
-        act = torch.argmax(pred_rewards)
+        pred_rewards = r_net.reward(x)[0]
+        #act = torch.argmax(pred_rewards)
+
+        act_probs = r_net.policy(x)[0]
+        act = torch.multinomial(act_probs, 1)[0]
 
         pixels_diff, reward, done = env.step(act, rendering)
         second_obvs = pixels_diff.unsqueeze(0).detach().clone()
@@ -208,50 +230,85 @@ def train_one_epoch(r_net, r_optimizer, env):
 
         memory.append((first_obvs[0], second_obvs[0], torch.tensor(act), torch.tensor(reward)))
 
-        batch_weights.append(pred_rewards[act].item())
+        #batch_weights.append(pred_rewards[act].item())
 
         if rendering:
-            print(pred_rewards)
+            print("pred reward: ", pred_rewards, "act probs: ", act_probs, "act: ", act)
+            pass
 
-        if len(memory) >= BUFFER_SIZE:
-            batch = random.sample(memory, BUFFER_SIZE)
+        memory_counter += 1
+        if (memory_counter == BUFFER_SIZE):
+            batch_lens.append(BUFFER_SIZE)
+            #print("Time")
+            memory_counter = 0
+            batch = list(memory)[-BUFFER_SIZE:]
+
             batch_first_obvs, batch_after_obvs, batch_actions, rewards = map(torch.stack, zip(*batch))
-            # Do optimizer step for reward network
+
+            # reward_mean = torch.mean(rewards)
+            # reward_std = torch.std(rewards)
+            # reward_norm = (rewards - reward_mean) / reward_std
+            
+            
             r_optimizer.zero_grad()
 
-            predicted_scores = r_net(batch_first_obvs.to(device))
+            total_reward = torch.sum(rewards)
+            batch_returns.append(total_reward)
+            loss_rewards = total_reward.repeat(BUFFER_SIZE)
+
+            actor_loss = compute_loss(
+                r_net,
+                batch_first_obvs, 
+                batch_actions.to(device), 
+                loss_rewards.to(device).unsqueeze(-1),
+            )
+
+            training_batches += 1
+            if training_batches == 10:
+                stop = True 
+
+            #actor_loss.backward()
+
+            # Then do critic
+            #score_loss = 0
+            predicted_scores = r_net.reward(r_net(batch_first_obvs))
 
             predicted_and_chosen_scores = predicted_scores.gather(
                 1, 
                 batch_actions.unsqueeze(-1).to(device),
             )
 
-            shifted_predicted_scores = r_net(batch_after_obvs.to(device))
-            best_actions = torch.argmax(shifted_predicted_scores, axis=1)
+            x = r_net(batch_after_obvs.to(device))
+            action_probs = r_net.policy(x)
+            chosen_acts = torch.multinomial(action_probs, 1)
 
-            old_preds = saved_r_model(batch_after_obvs.to(device)).gather(
+            old_preds = saved_r_model.reward(saved_r_model(batch_after_obvs.to(device))).gather(
                 1,
-                best_actions.unsqueeze(-1).to(device),
+                chosen_acts.to(device),
             )
 
-            actual_scores = torch.tensor(rewards).to(device) + ALPHA * old_preds[0]
+            actual_scores = rewards.to(device) + ALPHA * old_preds[0]
 
             loss_fn = torch.nn.SmoothL1Loss()
-            score_loss = loss_fn(predicted_and_chosen_scores, actual_scores)
+            score_loss = loss_fn(predicted_and_chosen_scores, actual_scores.unsqueeze(-1))
 
             #import pdb; pdb.set_trace()
 
-            score_loss.backward()
+            #score_loss.backward()
+            
+            total_loss = actor_loss + score_loss
+            total_loss.backward()
+
             r_optimizer.step()
 
     # save changes to value net
-    r_net.load_state_dict(saved_r_model.state_dict())
+    saved_r_model.load_state_dict(r_net.state_dict())
 
     if rendering:
         pass
         #import pdb; pdb.set_trace()
 
-    return batch_loss, score_loss, batch_returns, batch_lens
+    return actor_loss, score_loss, batch_returns, batch_lens
 
 
 #LR = 1e-3
@@ -280,7 +337,7 @@ if __name__=="__main__":
             reward_optimizer, 
             env,
         )
-        print('epoch: %3d \t loss: %.3f \t score_loss: %.3f \t return: %.3f \t ep_len: %.3f'%
+        print('epoch: %3d \t actor_loss: %.3f \t score_loss: %.3f \t return: %.3f \t ep_len: %.3f'%
                 (i, batch_loss, score_loss, np.mean(batch_returns), np.mean(batch_lens)))
         
 
