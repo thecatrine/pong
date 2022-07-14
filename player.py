@@ -11,6 +11,7 @@ import collections
 from datetime import datetime
 import matplotlib.pyplot as plt
 
+import concurrent.futures
 from torch.utils.tensorboard import SummaryWriter
 writer = SummaryWriter()
 #model stuff
@@ -192,7 +193,8 @@ class RewardNetwork(torch.nn.Module):
 
 def compute_loss(net, obvs, actions, rewards):
     res = net.policy(net(obvs))
-    logprobs = torch.log(res.gather(1, actions.unsqueeze(-1)))
+    #import pdb; pdb.set_trace()
+    logprobs = torch.log(res.gather(1, actions))
 
     if logprobs.shape != rewards.shape:
         import pdb; pdb.set_trace()
@@ -201,25 +203,37 @@ def compute_loss(net, obvs, actions, rewards):
 
     return -torch.mean(logprobs * rewards)
 
+EPISODE_LENGTH = 200
+
+def collect_one_episode(r_net, env, render):
+    memory = []
+    state, reward, done = env.step()
+
+    for step in range(EPISODE_LENGTH):
+        first_obvs = state.to(device)
+        x = r_net(first_obvs.unsqueeze(0))
+
+        act_probs = r_net.policy(x)
+        act = torch.multinomial(act_probs, 1).item()
+
+        state, reward, done = env.step(act, render=render)
+
+        second_obvs = state.to(device)
+        memory.append((first_obvs, second_obvs, torch.tensor([act]), torch.tensor([reward])))
+
+
+    return memory
+
+# globals
 rendering = True
 running = True
-
-memory = collections.deque(maxlen=2000)
 
 def train_one_epoch(r_net, r_optimizer, envs):
     global rendering
     global running
-
-    batch_obvs = []
-    batch_policy_actions = []
-    batch_weights = []
-    batch_returns = []
-    batch_lens = []
-
-    pixels_diff, reward, done = env.step()
+    
     ep_rewards = []
-    done = False
-    stop = False
+
 
     BATCH_SIZE = 1000
     BUFFER_SIZE = 200
@@ -232,137 +246,93 @@ def train_one_epoch(r_net, r_optimizer, envs):
     saved_r_model = RewardNetwork().to(device)
     saved_r_model.load_state_dict(r_net.state_dict())
 
-    training_batches = 0
-    memory_counter = 0
+    NUM_THREADS = 10
+
+    batch_lens = []
 
     reporting_actor_loss = []
     reporting_score_loss = []
     reporting_entropy_loss = []
     reporting_rewards = []
     
-
-    while not stop:
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-                break
-            elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_SPACE:
-                    rendering = not rendering
-
-        first_obvs = pixels_diff.unsqueeze(0).to(device)
+    for batch in range(NUM_THREADS):
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            futures = [executor.submit(collect_one_episode, r_net, envs[i], False) for i in range(len(envs)-1)]
         
-        batch_obvs.append(first_obvs)
+        shown_result = collect_one_episode(r_net, envs[-1], True)
 
-        x = r_net(first_obvs.to(device))
+        results = shown_result
+        for f in futures:
+            results += f.result()
+        
+        batch_lens.append(EPISODE_LENGTH * NUM_THREADS)
 
-        # Get rewards estimate from critic
-        pred_rewards = r_net.reward(x)[0]
-        #act = torch.argmax(pred_rewards)
-
-        act_probs = r_net.policy(x)[0]
-        act = torch.multinomial(act_probs, 1)[0]
-
-        pixels_diff, reward, done = env.step(act, rendering)
-        second_obvs = pixels_diff.unsqueeze(0).detach().clone()
+        first_obvs, after_obvs, actions, rewards = map(torch.stack, zip(*results))
+        actions = actions.to(device)
 
         # normalize rewards
-
-        memory.append((first_obvs[0], second_obvs[0], torch.tensor(act), torch.tensor(reward)))
-
-        #batch_weights.append(pred_rewards[act].item())
-
-        if rendering:
-            print("pred reward: ", pred_rewards.cpu().detach().numpy(), "act probs: ", act_probs.cpu().detach().numpy(), "act: ", act)
-            pass
-
-        memory_counter += 1
-        if (memory_counter == BUFFER_SIZE):
-            batch_lens.append(BUFFER_SIZE)
-            #print("Time")
-            memory_counter = 0
-            batch = list(memory)[-BUFFER_SIZE:]
-
-            batch_first_obvs, batch_after_obvs, batch_actions, rewards = map(torch.stack, zip(*batch))
-
-            # normalize rewards
-            #rewards = torch.nn.functional.normalize(rewards, dim=-1)
+        #rewards = torch.nn.functional.normalize(rewards, dim=-1)
             
-            r_optimizer.zero_grad()
+        r_optimizer.zero_grad()
 
-            # Then do critic
-            #score_loss = 0
-            predicted_scores = r_net.reward(r_net(batch_first_obvs))
+        predicted_scores = r_net.reward(r_net(first_obvs))
 
-            predicted_and_chosen_scores = predicted_scores.gather(
-                1, 
-                batch_actions.unsqueeze(-1).to(device),
-            )
+        predicted_and_chosen_scores = predicted_scores.gather(1, actions)
 
-            x = r_net(batch_after_obvs.to(device))
-            chosen_acts = torch.multinomial(r_net.policy(x), 1)
+        # Can we reuse the one we already have? RSI
+        x = r_net(after_obvs)
+        chosen_acts = torch.multinomial(r_net.policy(x), 1)
 
-            old_preds = saved_r_model.reward(
-                saved_r_model(batch_after_obvs.to(device))
-            ).gather(
-                1,
-                chosen_acts.to(device),
-            )
+        old_preds = saved_r_model.reward(
+            saved_r_model(after_obvs)
+        ).gather(
+            1,
+            chosen_acts.to(device),
+        )
 
-            final_guess = old_preds[-1][0]
-            #import pdb; pdb.set_trace()
+        final_guess = old_preds[-1][0]
+        #import pdb; pdb.set_trace()
 
-            actual_scores = rewards.to(device).clone()
-            actual_scores[-1] += final_guess
-            for jj in range(len(actual_scores) - 2, -1, -1):
-                actual_scores[jj] += actual_scores[jj + 1] * ALPHA
+        actual_scores = rewards.to(device).clone()
+        actual_scores[-1] += final_guess
+        for jj in range(len(actual_scores) - 2, -1, -1):
+            actual_scores[jj] += actual_scores[jj + 1] * ALPHA
 
-            loss_fn = torch.nn.SmoothL1Loss()
-            score_loss = loss_fn(predicted_and_chosen_scores, actual_scores.unsqueeze(-1))
+        loss_fn = torch.nn.SmoothL1Loss()
+        score_loss = loss_fn(predicted_and_chosen_scores, actual_scores)
 
-            # Actor
+        # Actor
 
-            advantage = actual_scores.unsqueeze(-1) - predicted_and_chosen_scores.detach()
+        advantage = actual_scores - predicted_and_chosen_scores.detach()
 
-            #import pdb; pdb.set_trace()
-            actor_loss = compute_loss(
-                r_net,
-                batch_first_obvs, 
-                batch_actions.to(device), 
-                advantage.to(device),
-            )
+        #import pdb; pdb.set_trace()
+        actor_loss = compute_loss(
+            r_net,
+            first_obvs, 
+            actions, 
+            advantage.to(device),
+        )
 
-            training_batches += 1
-            if training_batches == 10:
-                stop = True 
+        # Entropy Loss
 
-            #actor_loss.backward()
+        x = r_net(first_obvs.to(device))
+        act_probs2 = r_net.policy(x)
+        act_probs2 = act_probs2.gather(1, actions)
 
-            #score_loss.backward()
-
-            x = r_net(batch_first_obvs.to(device))
-            act_probs2 = r_net.policy(x)
-            act_probs2 = act_probs2.gather(1, batch_actions.unsqueeze(-1).to(device))
-
-            #import pdb; pdb.set_trace()
-            entropy_loss = torch.sum(act_probs2 * torch.log(act_probs2))
+        entropy_loss = torch.sum(act_probs2 * torch.log(act_probs2))
             
-            total_loss = 1*score_loss + 0.5*actor_loss + 0.003*entropy_loss
-            total_loss.backward()
+        total_loss = 1*score_loss + 0.5*actor_loss + 0.003*entropy_loss
+        total_loss.backward()
 
-            r_optimizer.step()
+        r_optimizer.step()
 
-            reporting_actor_loss.append(actor_loss.item())
-            reporting_score_loss.append(score_loss.item())
-            reporting_entropy_loss.append(entropy_loss.item())
-            reporting_rewards.append(rewards.sum())
+        reporting_actor_loss.append(actor_loss.item())
+        reporting_score_loss.append(score_loss.item())
+        reporting_entropy_loss.append(entropy_loss.item())
+        reporting_rewards.append(rewards.sum())
 
     # save changes to value net
     saved_r_model.load_state_dict(r_net.state_dict())
-
-    if rendering:
-        pass
-        #import pdb; pdb.set_trace()
 
     return torch.mean(torch.tensor(reporting_actor_loss), dtype=torch.float), \
         torch.mean(torch.tensor(reporting_score_loss), dtype=torch.float),    \
@@ -396,7 +366,7 @@ if __name__=="__main__":
         actor_loss, score_loss, entropy_loss, rewards, batch_lens = train_one_epoch(
             reward_model, 
             reward_optimizer, 
-            env,
+            envs,
         )
         print('epoch: %3d \t actor_loss: %.3f \t score_loss: %.3f \t entropy_loss: %.3f \t return: %.3f \t ep_len: %.3f'%
                 (i, actor_loss, score_loss, entropy_loss, rewards, batch_lens))
