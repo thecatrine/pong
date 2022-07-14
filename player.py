@@ -8,7 +8,11 @@ import random
 import argparse
 import collections
 
+from datetime import datetime
 import matplotlib.pyplot as plt
+
+from torch.utils.tensorboard import SummaryWriter
+writer = SummaryWriter()
 #model stuff
 
 # input - [paddle x, ball x, ball y, ball vx, ball vy]
@@ -19,6 +23,8 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--model', type=str, default='', help='model file to load')
 parser.add_argument('--device', type=str, default='cuda', help='device to use')
 args = parser.parse_args()
+
+logdir = "runs/" + datetime.now().strftime("%Y%m%d-%H%M%S")
 
 def show(pic):
     plt.imshow(pic)
@@ -154,11 +160,11 @@ class RewardNetwork(torch.nn.Module):
 
         #self.linear = torch.nn.Linear(1024, 256)
         self.linear = torch.nn.Linear(64, 256)
-        self.reward_head_1 = torch.nn.Linear(256, 16)
-        self.reward_head_2 = torch.nn.Linear(16, 3)
+        self.reward_head_1 = torch.nn.Linear(256, 3)
+        #self.reward_head_2 = torch.nn.Linear(16, 3)
 
-        self.policy_head_1 = torch.nn.Linear(256, 16)
-        self.policy_head_2 = torch.nn.Linear(16, 3)
+        self.policy_head_1 = torch.nn.Linear(256, 3)
+       # self.policy_head_2 = torch.nn.Linear(16, 3)
 
     def forward(self, x):
         x = torch.nn.functional.silu(self.first(x))
@@ -172,12 +178,12 @@ class RewardNetwork(torch.nn.Module):
 
     def reward(self, x ):
         x = self.reward_head_1(x)
-        x = self.reward_head_2(x)
+        #x = self.reward_head_2(x)
         return x
 
     def policy(self, x ):
         x = self.policy_head_1(x)
-        x = self.policy_head_2(x)
+        #x = self.policy_head_2(x)
         
         return torch.softmax(x, dim=-1)
 
@@ -200,7 +206,7 @@ running = True
 
 memory = collections.deque(maxlen=2000)
 
-def train_one_epoch(r_net, r_optimizer, env):
+def train_one_epoch(r_net, r_optimizer, envs):
     global rendering
     global running
 
@@ -216,7 +222,7 @@ def train_one_epoch(r_net, r_optimizer, env):
     stop = False
 
     BATCH_SIZE = 1000
-    BUFFER_SIZE = 600
+    BUFFER_SIZE = 200
 
     ALPHA = 0.95
 
@@ -228,6 +234,12 @@ def train_one_epoch(r_net, r_optimizer, env):
 
     training_batches = 0
     memory_counter = 0
+
+    reporting_actor_loss = []
+    reporting_score_loss = []
+    reporting_entropy_loss = []
+    reporting_rewards = []
+    
 
     while not stop:
         for event in pygame.event.get():
@@ -249,11 +261,7 @@ def train_one_epoch(r_net, r_optimizer, env):
         #act = torch.argmax(pred_rewards)
 
         act_probs = r_net.policy(x)[0]
-        # 3 % of time move randomly
-        if random.random() < 0.3:
-            act = torch.tensor([random.randint(0, 2)])[0].to(device)
-        else:
-            act = torch.multinomial(act_probs, 1)[0]
+        act = torch.multinomial(act_probs, 1)[0]
 
         pixels_diff, reward, done = env.step(act, rendering)
         second_obvs = pixels_diff.unsqueeze(0).detach().clone()
@@ -309,19 +317,19 @@ def train_one_epoch(r_net, r_optimizer, env):
             for jj in range(len(actual_scores) - 2, -1, -1):
                 actual_scores[jj] += actual_scores[jj + 1] * ALPHA
 
-            loss_fn = torch.nn.MSELoss()
+            loss_fn = torch.nn.SmoothL1Loss()
             score_loss = loss_fn(predicted_and_chosen_scores, actual_scores.unsqueeze(-1))
 
             # Actor
 
             advantage = actual_scores.unsqueeze(-1) - predicted_and_chosen_scores.detach()
-            actor_weights = torch.sum(advantage.squeeze().to(device), dim=-1).repeat(len(rewards))
+
             #import pdb; pdb.set_trace()
             actor_loss = compute_loss(
                 r_net,
                 batch_first_obvs, 
                 batch_actions.to(device), 
-                actor_weights.to(device).unsqueeze(-1),
+                advantage.to(device),
             )
 
             training_batches += 1
@@ -337,12 +345,17 @@ def train_one_epoch(r_net, r_optimizer, env):
             act_probs2 = act_probs2.gather(1, batch_actions.unsqueeze(-1).to(device))
 
             #import pdb; pdb.set_trace()
-            entropy_loss = -torch.sum(act_probs2 * torch.log(act_probs2))
+            entropy_loss = torch.sum(act_probs2 * torch.log(act_probs2))
             
-            total_loss = 1*score_loss + 0.5*actor_loss + 0.01*entropy_loss
+            total_loss = 1*score_loss + 0.5*actor_loss + 0.003*entropy_loss
             total_loss.backward()
 
             r_optimizer.step()
+
+            reporting_actor_loss.append(actor_loss.item())
+            reporting_score_loss.append(score_loss.item())
+            reporting_entropy_loss.append(entropy_loss.item())
+            reporting_rewards.append(rewards.sum())
 
     # save changes to value net
     saved_r_model.load_state_dict(r_net.state_dict())
@@ -351,7 +364,11 @@ def train_one_epoch(r_net, r_optimizer, env):
         pass
         #import pdb; pdb.set_trace()
 
-    return actor_loss, score_loss, batch_returns, batch_lens
+    return torch.mean(torch.tensor(reporting_actor_loss), dtype=torch.float), \
+        torch.mean(torch.tensor(reporting_score_loss), dtype=torch.float),    \
+        torch.mean(torch.tensor(reporting_entropy_loss), dtype=torch.float),  \
+        torch.sum(torch.tensor(reporting_rewards), dtype=torch.float), \
+        torch.mean(torch.tensor(batch_lens, dtype=torch.float))
 
 
 #LR = 1e-3
@@ -369,23 +386,29 @@ reward_model.to(device)
 
 
 if __name__=="__main__":
-    env = PongEnv()
-    env.reset()
+    envs = [PongEnv() for i in range(10)]
+    for env in envs:
+        env.reset()
 
     i = 0
     while running:
         i += 1
-        batch_loss, score_loss, batch_returns, batch_lens = train_one_epoch(
+        actor_loss, score_loss, entropy_loss, rewards, batch_lens = train_one_epoch(
             reward_model, 
             reward_optimizer, 
             env,
         )
-        print('epoch: %3d \t actor_loss: %.3f \t score_loss: %.3f \t return: %.3f \t ep_len: %.3f'%
-                (i, batch_loss, score_loss, np.mean(batch_returns), np.mean(batch_lens)))
+        print('epoch: %3d \t actor_loss: %.3f \t score_loss: %.3f \t entropy_loss: %.3f \t return: %.3f \t ep_len: %.3f'%
+                (i, actor_loss, score_loss, entropy_loss, rewards, batch_lens))
+        writer.add_scalar('actor_loss', actor_loss, i)
+        writer.add_scalar('score_loss', score_loss, i)
+        writer.add_scalar('entropy_loss', entropy_loss, i)
+        writer.add_scalar('rewards', rewards, i)
+        
         
 
     # Done! Time to quit.
     pygame.quit()
 
 # Save model to file
-torch.save(model.state_dict(), 'model.pt')
+torch.save(reward_model.state_dict(), 'model.pt')
