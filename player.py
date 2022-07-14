@@ -49,6 +49,7 @@ class PongEnv():
         self.paddle_loc = [250, self.HEIGHT-self.paddle_height-5]
         self.game_counter = 0
         self.old_pixels = None
+        self.old_game_state = None
 
         return self.step()
 
@@ -118,9 +119,22 @@ class PongEnv():
 
         pixels_to_return = torch.cat((pixels, self.old_pixels))
 
+        game_state = torch.tensor([self.ball_loc[0], self.ball_loc[1], self.ball_speed[0], self.ball_speed[1], self.paddle_loc[0]])
+
+        if self.old_game_state is None:
+            self.old_game_state = game_state
+
+        pixels_to_return = torch.tensor(
+            [self.ball_loc[0], self.ball_loc[1], self.ball_speed[0], self.ball_speed[1], self.paddle_loc[0],
+            ],
+            dtype=torch.float)
+
         #import pdb; pdb.set_trace()
 
+        pixels_to_return = torch.cat((pixels_to_return, self.old_game_state))
+
         self.old_pixels = pixels
+        self.old_game_state = game_state
         
         # return values are (state, reward, done)
         return pixels_to_return, reward, done
@@ -131,19 +145,25 @@ class RewardNetwork(torch.nn.Module):
         super().__init__()
         # taken from https://pytorch.org/tutorials/intermediate/mario_rl_tutorial.html
         # no idea if they're good here, should think this through
-        self.first = torch.nn.Conv2d(2, 64, kernel_size=8, stride=4)
-        self.second = torch.nn.Conv2d(64, 128, kernel_size=4, stride=2)
-        self.third = torch.nn.Conv2d(128, 128, kernel_size=3, stride=1)
+        #self.first = torch.nn.Conv2d(2, 32, kernel_size=8, stride=4)
+        #self.second = torch.nn.Conv2d(32, 64, kernel_size=4, stride=2)
+        #self.third = torch.nn.Conv2d(64, 64, kernel_size=3, stride=1)
 
-        self.linear = torch.nn.Linear(2048, 256)
-        self.reward_head = torch.nn.Linear(256, 3)
+        self.first = torch.nn.Linear(10, 32)
+        self.second = torch.nn.Linear(32, 64)
 
-        self.policy_head = torch.nn.Linear(256, 3)
+        #self.linear = torch.nn.Linear(1024, 256)
+        self.linear = torch.nn.Linear(64, 256)
+        self.reward_head_1 = torch.nn.Linear(256, 16)
+        self.reward_head_2 = torch.nn.Linear(16, 3)
+
+        self.policy_head_1 = torch.nn.Linear(256, 16)
+        self.policy_head_2 = torch.nn.Linear(16, 3)
 
     def forward(self, x):
         x = torch.nn.functional.silu(self.first(x))
         x = torch.nn.functional.silu(self.second(x))
-        x = torch.nn.functional.silu(self.third(x))
+        #x = torch.nn.functional.silu(self.third(x))
         x = x.view(x.size(0), -1)
 
         x = torch.nn.functional.silu(self.linear(x))
@@ -151,20 +171,27 @@ class RewardNetwork(torch.nn.Module):
         return x
 
     def reward(self, x ):
-        return self.reward_head(x)
+        x = self.reward_head_1(x)
+        x = self.reward_head_2(x)
+        return x
 
     def policy(self, x ):
-        return torch.softmax(self.policy_head(x), dim=-1)
+        x = self.policy_head_1(x)
+        x = self.policy_head_2(x)
+        
+        return torch.softmax(x, dim=-1)
 
     
 
 
 def compute_loss(net, obvs, actions, rewards):
     res = net.policy(net(obvs))
-    logprobs = res.gather(1, actions.unsqueeze(-1))
+    logprobs = torch.log(res.gather(1, actions.unsqueeze(-1)))
 
     if logprobs.shape != rewards.shape:
         import pdb; pdb.set_trace()
+
+    #import pdb; pdb.set_trace()
 
     return -torch.mean(logprobs * rewards)
 
@@ -189,7 +216,7 @@ def train_one_epoch(r_net, r_optimizer, env):
     stop = False
 
     BATCH_SIZE = 1000
-    BUFFER_SIZE = 300
+    BUFFER_SIZE = 600
 
     ALPHA = 0.95
 
@@ -219,10 +246,14 @@ def train_one_epoch(r_net, r_optimizer, env):
 
         # Get rewards estimate from critic
         pred_rewards = r_net.reward(x)[0]
-        act = torch.argmax(pred_rewards)
+        #act = torch.argmax(pred_rewards)
 
         act_probs = r_net.policy(x)[0]
-        #act = torch.multinomial(act_probs, 1)[0]
+        # 3 % of time move randomly
+        if random.random() < 0.3:
+            act = torch.tensor([random.randint(0, 2)])[0].to(device)
+        else:
+            act = torch.multinomial(act_probs, 1)[0]
 
         pixels_diff, reward, done = env.step(act, rendering)
         second_obvs = pixels_diff.unsqueeze(0).detach().clone()
@@ -234,7 +265,7 @@ def train_one_epoch(r_net, r_optimizer, env):
         #batch_weights.append(pred_rewards[act].item())
 
         if rendering:
-            print("pred reward: ", pred_rewards, "act probs: ", act_probs, "act: ", act)
+            print("pred reward: ", pred_rewards.cpu().detach().numpy(), "act probs: ", act_probs.cpu().detach().numpy(), "act: ", act)
             pass
 
         memory_counter += 1
@@ -247,27 +278,9 @@ def train_one_epoch(r_net, r_optimizer, env):
             batch_first_obvs, batch_after_obvs, batch_actions, rewards = map(torch.stack, zip(*batch))
 
             # normalize rewards
-            rewards = torch.nn.functional.normalize(rewards, dim=-1)
-            
+            #rewards = torch.nn.functional.normalize(rewards, dim=-1)
             
             r_optimizer.zero_grad()
-
-            total_reward = torch.sum(rewards)
-            batch_returns.append(total_reward)
-            loss_rewards = total_reward.repeat(BUFFER_SIZE)
-
-            actor_loss = compute_loss(
-                r_net,
-                batch_first_obvs, 
-                batch_actions.to(device), 
-                loss_rewards.to(device).unsqueeze(-1),
-            )
-
-            training_batches += 1
-            if training_batches == 10:
-                stop = True 
-
-            #actor_loss.backward()
 
             # Then do critic
             #score_loss = 0
@@ -279,9 +292,7 @@ def train_one_epoch(r_net, r_optimizer, env):
             )
 
             x = r_net(batch_after_obvs.to(device))
-            action_rewards = r_net.reward(x)
-            chosen_acts = torch.argmax(action_rewards, dim=-1).unsqueeze(-1)
-            print("chosen acts: ", chosen_acts.shape)
+            chosen_acts = torch.multinomial(r_net.policy(x), 1)
 
             old_preds = saved_r_model.reward(
                 saved_r_model(batch_after_obvs.to(device))
@@ -298,12 +309,37 @@ def train_one_epoch(r_net, r_optimizer, env):
             for jj in range(len(actual_scores) - 2, -1, -1):
                 actual_scores[jj] += actual_scores[jj + 1] * ALPHA
 
-            loss_fn = torch.nn.SmoothL1Loss()
+            loss_fn = torch.nn.MSELoss()
             score_loss = loss_fn(predicted_and_chosen_scores, actual_scores.unsqueeze(-1))
 
+            # Actor
+
+            advantage = actual_scores.unsqueeze(-1) - predicted_and_chosen_scores.detach()
+            actor_weights = torch.sum(advantage.squeeze().to(device), dim=-1).repeat(len(rewards))
+            #import pdb; pdb.set_trace()
+            actor_loss = compute_loss(
+                r_net,
+                batch_first_obvs, 
+                batch_actions.to(device), 
+                actor_weights.to(device).unsqueeze(-1),
+            )
+
+            training_batches += 1
+            if training_batches == 10:
+                stop = True 
+
+            #actor_loss.backward()
+
             #score_loss.backward()
+
+            x = r_net(batch_first_obvs.to(device))
+            act_probs2 = r_net.policy(x)
+            act_probs2 = act_probs2.gather(1, batch_actions.unsqueeze(-1).to(device))
+
+            #import pdb; pdb.set_trace()
+            entropy_loss = -torch.sum(act_probs2 * torch.log(act_probs2))
             
-            total_loss = score_loss # + actor_loss
+            total_loss = 1*score_loss + 0.5*actor_loss + 0.01*entropy_loss
             total_loss.backward()
 
             r_optimizer.step()
