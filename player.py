@@ -311,14 +311,17 @@ def train_one_epoch(r_net, r_optimizer, envs):
     after_actions = torch.cat([torch.tensor(x).to(device) for x in all_after_actions], dim=0).unsqueeze(-1)
     after_obvs_batches = torch.stack([torch.stack(x) for x in all_after_obvs])
     last_step = after_obvs_batches[:, -1, :]
-    last_x = r_net(last_step)
-    last_guess = r_net.reward(last_x)
+    last_x = saved_r_model(last_step)
+    last_guess = saved_r_model.reward(last_x)
     last_action_probs = r_net.policy(last_x)
     last_action = torch.multinomial(last_action_probs, 1)
     last_value = torch.gather(last_guess, dim=1, index = last_action)
     
     orig_rewards = torch.stack([torch.tensor(x).to(device) for x in all_rewards])
     rewards = orig_rewards.clone()
+
+    #normalize rewards
+    rewards = torch.nn.functional.normalize(rewards, dim=-1)
 
     rewards[:, -1] += last_value[:, 0]
     for step in range(EPISODE_LENGTH-2, -1, -1):
@@ -345,7 +348,7 @@ def train_one_epoch(r_net, r_optimizer, envs):
 
         actual_scores = rewards
 
-        loss_fn = torch.nn.MSELoss()
+        loss_fn = torch.nn.SmoothL1Loss()
         score_loss = loss_fn(predicted_and_chosen_scores, actual_scores)
 
         # Actor
