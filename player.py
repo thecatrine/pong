@@ -216,7 +216,8 @@ def gradient_norm(model):
 rendering = True
 running = True
 
-NUM_THREADS = 32
+
+NUM_THREADS = 16
 
 def train_one_epoch(r_net, r_optimizer, envs):
     global rendering
@@ -328,48 +329,47 @@ def train_one_epoch(r_net, r_optimizer, envs):
 
     # have to do rollout reward logic specially
     r_optimizer.zero_grad()
-    #with autograd.detect_anomaly():
-    predicted_scores = r_net.reward(r_net(first_obvs))
+    with autograd.detect_anomaly():
+        predicted_scores = r_net.reward(r_net(first_obvs))
 
-    #import pdb; pdb.set_trace()
-    predicted_and_chosen_scores = predicted_scores.gather(1, actions)
+        #import pdb; pdb.set_trace()
+        predicted_and_chosen_scores = predicted_scores.gather(1, actions)
 
-    old_preds = saved_r_model.reward(
-        saved_r_model(after_obvs.to(device))
-    ).gather(
-        1,
-        after_actions.to(device),
-    )
+        old_preds = saved_r_model.reward(
+            saved_r_model(after_obvs.to(device))
+        ).gather(
+            1,
+            after_actions.to(device),
+        )
 
 
-    actual_scores = rewards
+        actual_scores = rewards
 
-    loss_fn = torch.nn.MSELoss()
-    score_loss = loss_fn(predicted_and_chosen_scores, actual_scores)
+        loss_fn = torch.nn.MSELoss()
+        score_loss = loss_fn(predicted_and_chosen_scores, actual_scores)
 
-    # Actor
+        # Actor
 
-    advantage = actual_scores - predicted_and_chosen_scores.detach()
+        advantage = actual_scores - predicted_and_chosen_scores.detach()
 
-    #import pdb; pdb.set_trace()
-    actor_loss = compute_loss(
-        r_net,
-        first_obvs, 
-        actions, 
-        advantage.to(device),
-    )
+        #import pdb; pdb.set_trace()
+        actor_loss = compute_loss(
+            r_net,
+            first_obvs, 
+            actions, 
+            advantage.to(device),
+        )
 
-    # Entropy Loss
+        # Entropy Loss
 
-    act_probs2 = r_net.policy(r_net(first_obvs))
-    act_probs2 = act_probs2.gather(1, actions)
+        act_probs2 = r_net.policy(r_net(first_obvs))
+        act_probs2 = act_probs2.gather(1, actions)
 
-    entropy_loss = torch.mean(act_probs2 * torch.log(act_probs2))
-        
-    total_loss = 1*score_loss + 0.5*actor_loss + 2*entropy_loss
+        entropy_loss = torch.mean(act_probs2 * torch.log(act_probs2))
+            
+        total_loss = 1*score_loss + 0.5*actor_loss + 2*entropy_loss
 
-    total_loss.backward()
-    # end detect anomaly
+        total_loss.backward()
 
     torch.nn.utils.clip_grad_norm_(r_net.parameters(), 200)
 
