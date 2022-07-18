@@ -160,14 +160,14 @@ class RewardNetwork(torch.nn.Module):
         #self.third = torch.nn.Conv2d(64, 64, kernel_size=3, stride=1)
 
         self.first = torch.nn.Linear(10, 32)
-        self.second = torch.nn.Linear(32, 64)
+        self.second = torch.nn.Linear(32, 32)
 
         #self.linear = torch.nn.Linear(1024, 256)
-        self.linear = torch.nn.Linear(64, 256)
-        self.reward_head_1 = torch.nn.Linear(256, 3)
+        self.linear = torch.nn.Linear(32, 32)
+        self.reward_head_1 = torch.nn.Linear(32, 3)
         #self.reward_head_2 = torch.nn.Linear(16, 3)
 
-        self.policy_head_1 = torch.nn.Linear(256, 3)
+        self.policy_head_1 = torch.nn.Linear(32, 3)
        # self.policy_head_2 = torch.nn.Linear(16, 3)
 
     def forward(self, x):
@@ -266,9 +266,13 @@ def train_one_epoch(r_net, r_optimizer, envs):
         first_obvs = torch.stack(state).to(device)
         x = r_net(first_obvs)
         act_probs = r_net.policy(x)
+        act_values = r_net.reward(x)
         
         # take a random action 3% of the time
-        act = torch.multinomial(act_probs, 1)
+        if random.random() < 0.03:
+            act = torch.tensor([random.randint(0, 2) for _ in range(NUM_THREADS)])
+        else:
+            act = torch.argmax(act_values, 1)
 
        
         if rendering:
@@ -309,19 +313,21 @@ def train_one_epoch(r_net, r_optimizer, envs):
     after_obvs = torch.cat([torch.stack(x) for x in all_after_obvs], dim=0)
     actions = torch.cat([torch.tensor(x).to(device) for x in all_actions], dim=0).unsqueeze(-1)
     after_actions = torch.cat([torch.tensor(x).to(device) for x in all_after_actions], dim=0).unsqueeze(-1)
+    
     after_obvs_batches = torch.stack([torch.stack(x) for x in all_after_obvs])
+    after_actions_batches = torch.stack([torch.tensor(x).to(device) for x in all_after_actions])
     last_step = after_obvs_batches[:, -1, :]
     last_x = saved_r_model(last_step)
     last_guess = saved_r_model.reward(last_x)
-    last_action_probs = r_net.policy(last_x)
-    last_action = torch.multinomial(last_action_probs, 1)
-    last_value = torch.gather(last_guess, dim=1, index = last_action)
+    last_acts = after_actions_batches[:, -1].unsqueeze(-1)
+
+    last_value = torch.gather(last_guess, dim=1, index = last_acts)
     
     orig_rewards = torch.stack([torch.tensor(x).to(device) for x in all_rewards])
     rewards = orig_rewards.clone()
 
     #normalize rewards
-    rewards = torch.nn.functional.normalize(rewards, dim=-1)
+    #rewards = torch.nn.functional.normalize(rewards, dim=-1)
 
     rewards[:, -1] += last_value[:, 0]
     for step in range(EPISODE_LENGTH-2, -1, -1):
@@ -332,47 +338,47 @@ def train_one_epoch(r_net, r_optimizer, envs):
 
     # have to do rollout reward logic specially
     r_optimizer.zero_grad()
-    with autograd.detect_anomaly():
-        predicted_scores = r_net.reward(r_net(first_obvs))
+    #with autograd.detect_anomaly():
+    predicted_scores = r_net.reward(r_net(first_obvs))
 
-        #import pdb; pdb.set_trace()
-        predicted_and_chosen_scores = predicted_scores.gather(1, actions)
+    #import pdb; pdb.set_trace()
+    predicted_and_chosen_scores = predicted_scores.gather(1, actions)
 
-        old_preds = saved_r_model.reward(
-            saved_r_model(after_obvs.to(device))
-        ).gather(
-            1,
-            after_actions.to(device),
-        )
+    old_preds = saved_r_model.reward(
+        saved_r_model(after_obvs.to(device))
+    ).gather(
+        1,
+        after_actions.to(device),
+    )
 
 
-        actual_scores = rewards
+    actual_scores = rewards
 
-        loss_fn = torch.nn.SmoothL1Loss()
-        score_loss = loss_fn(predicted_and_chosen_scores, actual_scores)
+    loss_fn = torch.nn.SmoothL1Loss()
+    score_loss = loss_fn(predicted_and_chosen_scores, actual_scores)
 
-        # Actor
+    # Actor
 
-        advantage = actual_scores - predicted_and_chosen_scores.detach()
+    advantage = actual_scores - predicted_and_chosen_scores.detach()
 
-        #import pdb; pdb.set_trace()
-        actor_loss = compute_loss(
-            r_net,
-            first_obvs, 
-            actions, 
-            advantage.to(device),
-        )
+    #import pdb; pdb.set_trace()
+    actor_loss = compute_loss(
+        r_net,
+        first_obvs, 
+        actions, 
+        advantage.to(device),
+    )
 
-        # Entropy Loss
+    # Entropy Loss
 
-        act_probs2 = r_net.policy(r_net(first_obvs))
-        act_probs2 = act_probs2.gather(1, actions)
+    act_probs2 = r_net.policy(r_net(first_obvs))
+    act_probs2 = act_probs2.gather(1, actions)
 
-        entropy_loss = torch.mean(act_probs2 * torch.log(act_probs2))
-            
-        total_loss = 1*score_loss + 0.5*actor_loss + 2*entropy_loss
+    entropy_loss = torch.mean(act_probs2 * torch.log(act_probs2))
+        
+    total_loss = 1*score_loss # + 0.5*actor_loss + 2*entropy_loss
 
-        total_loss.backward()
+    total_loss.backward()
 
     torch.nn.utils.clip_grad_norm_(r_net.parameters(), 200)
 
